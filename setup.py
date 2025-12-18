@@ -3,9 +3,17 @@ Setup script for Ghostline Signal.
 """
 
 from setuptools import setup, find_packages
+from pathlib import Path
 
-with open("README.md", "r", encoding="utf-8") as fh:
-    long_description = fh.read()
+# Get the directory containing this setup.py file
+here = Path(__file__).parent.resolve()
+
+# Read the README file
+readme_file = here / "README.md"
+if readme_file.exists():
+    long_description = readme_file.read_text(encoding="utf-8")
+else:
+    long_description = "Ghostline Signal - Peer-to-peer communication system with privacy and locality focus"
 
 setup(
     name="ghostline-signal",
