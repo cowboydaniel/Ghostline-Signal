@@ -191,11 +191,25 @@ class MainWindow(QMainWindow):
     def init_connection_broker(self):
         """Initialize connection broker for automatic NAT traversal."""
         try:
+            import os
             device_id = self.identity.get_device_id()
+
+            # Check for rendezvous server configuration
+            rendezvous_server = os.environ.get('GHOSTLINE_RENDEZVOUS_SERVER')
+            use_rendezvous = rendezvous_server is not None
+
+            if not rendezvous_server:
+                # Try localhost:8080 by default
+                if self._check_rendezvous_available('localhost', 8080):
+                    rendezvous_server = 'localhost:8080'
+                    use_rendezvous = True
+                    print("[ConnectionBroker] Auto-detected rendezvous server at localhost:8080")
+
             self.connection_broker = ConnectionBroker(
                 self.p2p_node,
                 device_id,
-                use_rendezvous=False  # Disabled by default (no central server)
+                use_rendezvous=use_rendezvous,
+                rendezvous_server=rendezvous_server
             )
 
             # Initialize in background
@@ -210,6 +224,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Connection broker initialization failed: {e}")
             # Non-fatal - can still use manual connections
+
+    def _check_rendezvous_available(self, host: str, port: int) -> bool:
+        """Check if rendezvous server is available."""
+        try:
+            import http.client
+            conn = http.client.HTTPConnection(host, port, timeout=1)
+            conn.request('GET', '/health')
+            resp = conn.getresponse()
+            conn.close()
+            return resp.status == 200
+        except:
+            return False
 
     def on_broker_status(self, message: str):
         """Handle connection broker status updates."""
