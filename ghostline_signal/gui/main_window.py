@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QAction
 
 from ..crypto import KeyManager, MessageEncryption
-from ..network import P2PNode
+from ..network import P2PNode, ConnectionBroker
 from ..storage import MessageStore
 from ..identity import DeviceIdentity
 from .widgets import MessageBubble, PeerListItem, ConnectionStatus
@@ -34,6 +34,9 @@ class MainWindow(QMainWindow):
         self.p2p_node = P2PNode()
         self.encryption = MessageEncryption()
 
+        # Connection broker for automatic NAT traversal
+        self.connection_broker = None
+
         # Current state
         self.current_peer_id = None
         self.sessions = {}  # peer_id -> session_key
@@ -47,6 +50,9 @@ class MainWindow(QMainWindow):
 
         # Start P2P node
         self.start_node()
+
+        # Initialize connection broker
+        self.init_connection_broker()
 
         # Cleanup timer for expired sessions
         self.cleanup_timer = QTimer()
@@ -181,6 +187,34 @@ class MainWindow(QMainWindow):
             print(f"Node started on {host}:{port}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to start node: {e}")
+
+    def init_connection_broker(self):
+        """Initialize connection broker for automatic NAT traversal."""
+        try:
+            device_id = self.identity.get_device_id()
+            self.connection_broker = ConnectionBroker(
+                self.p2p_node,
+                device_id,
+                use_rendezvous=False  # Disabled by default (no central server)
+            )
+
+            # Initialize in background
+            def init_broker():
+                self.connection_broker.set_status_callback(self.on_broker_status)
+                self.connection_broker.initialize()
+
+            import threading
+            thread = threading.Thread(target=init_broker, daemon=True)
+            thread.start()
+
+        except Exception as e:
+            print(f"Connection broker initialization failed: {e}")
+            # Non-fatal - can still use manual connections
+
+    def on_broker_status(self, message: str):
+        """Handle connection broker status updates."""
+        print(f"[Broker] {message}")
+        # Could update status bar here
 
     def load_peers(self):
         """Load peers from storage."""
@@ -389,47 +423,152 @@ class MainWindow(QMainWindow):
         """Show dialog to connect to a peer."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Connect to Peer")
-        dialog.setMinimumWidth(400)
+        dialog.setMinimumWidth(500)
 
-        layout = QFormLayout()
+        main_layout = QVBoxLayout()
+
+        # Tab widget for different connection methods
+        tabs = QTabWidget()
+
+        # Tab 1: Connect by Device ID (Automatic)
+        device_id_tab = QWidget()
+        device_id_layout = QFormLayout()
+
+        device_id_input = QLineEdit()
+        device_id_input.setPlaceholderText("e.g., 550e8400-e29b-41d4-a716-446655440000")
+        device_id_layout.addRow("Device ID:", device_id_input)
+
+        info_label = QLabel("✓ Automatic NAT traversal\n✓ No port forwarding needed\n✓ Works globally")
+        info_label.setStyleSheet("color: #666; padding: 10px;")
+        device_id_layout.addRow(info_label)
+
+        device_id_tab.setLayout(device_id_layout)
+        tabs.addTab(device_id_tab, "By Device ID (Auto)")
+
+        # Tab 2: Connect by IP/Port (Manual)
+        manual_tab = QWidget()
+        manual_layout = QFormLayout()
 
         host_input = QLineEdit()
-        host_input.setPlaceholderText("e.g., 192.168.1.100")
-        layout.addRow("Host:", host_input)
+        host_input.setPlaceholderText("e.g., 192.168.1.100 or public IP")
+        manual_layout.addRow("Host:", host_input)
 
         port_input = QSpinBox()
         port_input.setRange(1024, 65535)
         port_input.setValue(5000)
-        layout.addRow("Port:", port_input)
+        manual_layout.addRow("Port:", port_input)
 
+        manual_info = QLabel("For local network or when peer has port forwarding")
+        manual_info.setStyleSheet("color: #666; padding: 10px;")
+        manual_layout.addRow(manual_info)
+
+        manual_tab.setLayout(manual_layout)
+        tabs.addTab(manual_tab, "By IP/Port (Manual)")
+
+        main_layout.addWidget(tabs)
+
+        # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
+        main_layout.addWidget(buttons)
 
-        dialog.setLayout(layout)
+        dialog.setLayout(main_layout)
 
         if dialog.exec() == QDialog.Accepted:
-            host = host_input.text().strip()
-            port = port_input.value()
+            current_tab = tabs.currentIndex()
 
-            if host:
-                try:
-                    peer_id = self.p2p_node.connect_to_peer(host, port)
-                    QMessageBox.information(self, "Success", f"Connected to {peer_id}")
+            if current_tab == 0:  # Device ID
+                device_id = device_id_input.text().strip()
+                if device_id:
+                    self.connect_by_device_id(device_id)
+            else:  # Manual IP/Port
+                host = host_input.text().strip()
+                port = port_input.value()
+                if host:
+                    self.connect_by_ip_port(host, port)
 
+    def connect_by_device_id(self, device_id: str):
+        """Connect to peer using device ID (automatic NAT traversal)."""
+        if not self.connection_broker:
+            QMessageBox.warning(self, "Not Available",
+                              "Connection broker not initialized.\nPlease use manual connection.")
+            return
+
+        # Show progress dialog
+        from PySide6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Discovering peer and establishing connection...",
+                                  "Cancel", 0, 0, self)
+        progress.setWindowTitle("Connecting")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        def attempt_connection():
+            try:
+                peer_id = self.connection_broker.connect_by_device_id(device_id)
+
+                if peer_id:
                     # Add to peers if not exists
                     if not self.message_store.get_peer(peer_id):
                         self.message_store.add_peer(
                             peer_id,
-                            b'',  # Public key will be exchanged later
-                            display_name=f"{host}:{port}"
+                            b'',
+                            display_name=device_id[:8]
                         )
 
-                    self.load_peers()
+                    # Update UI in main thread
+                    QTimer.singleShot(0, lambda: self.on_device_id_connected(peer_id, progress))
+                else:
+                    QTimer.singleShot(0, lambda: self.on_device_id_failed(progress))
 
-                except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to connect: {e}")
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self.on_device_id_error(str(e), progress))
+
+        import threading
+        thread = threading.Thread(target=attempt_connection, daemon=True)
+        thread.start()
+
+    def on_device_id_connected(self, peer_id: str, progress):
+        """Handle successful device ID connection."""
+        progress.close()
+        QMessageBox.information(self, "Success",
+                              f"Connected to peer!\n\nPeer ID: {peer_id}")
+        self.load_peers()
+
+    def on_device_id_failed(self, progress):
+        """Handle failed device ID connection."""
+        progress.close()
+        QMessageBox.warning(self, "Connection Failed",
+                          "Could not discover or connect to peer.\n\n"
+                          "Possible reasons:\n"
+                          "- Peer is offline\n"
+                          "- Peer not registered on rendezvous server\n"
+                          "- Network issues\n\n"
+                          "Try using manual IP/Port connection instead.")
+
+    def on_device_id_error(self, error: str, progress):
+        """Handle device ID connection error."""
+        progress.close()
+        QMessageBox.critical(self, "Error", f"Connection error: {error}")
+
+    def connect_by_ip_port(self, host: str, port: int):
+        """Connect to peer using IP and port (manual)."""
+        try:
+            peer_id = self.p2p_node.connect_to_peer(host, port)
+            QMessageBox.information(self, "Success", f"Connected to {peer_id}")
+
+            # Add to peers if not exists
+            if not self.message_store.get_peer(peer_id):
+                self.message_store.add_peer(
+                    peer_id,
+                    b'',  # Public key will be exchanged later
+                    display_name=f"{host}:{port}"
+                )
+
+            self.load_peers()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to connect: {e}")
 
     def show_add_peer_dialog(self):
         """Show dialog to add a peer identity."""
@@ -549,5 +688,7 @@ Misuse, misconfiguration, or loss of devices can result in permanent data loss.<
 
     def closeEvent(self, event):
         """Handle window close."""
+        if self.connection_broker:
+            self.connection_broker.shutdown()
         self.p2p_node.stop()
         event.accept()
