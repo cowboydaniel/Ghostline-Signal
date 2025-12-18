@@ -62,6 +62,17 @@ Presence is implicit rather than broadcast. There are no online indicators, read
 
 Silence is a valid state and leaks no information.
 
+## Interfaces and Deployment
+
+Ghostline Signal is provided in two forms:
+
+- A native desktop application built with PySide6, intended for direct use as part of the Ghostline Continuum.
+- A local web interface that can be hosted directly on a user’s own device.
+
+The web interface is designed to run entirely locally. If one user hosts Ghostline Signal on their own device and another user hosts their own instance on a separate device, the two instances can communicate directly with each other without relying on any external servers.
+
+In both cases, the same core guarantees apply: encryption keys remain local, message content is never exposed to intermediaries, and communication occurs directly between participating devices.
+
 ## Integration with the Ghostline Continuum
 
 Ghostline Signal is designed to operate alongside Ghostline Studio and Ghostline Browser as part of a cohesive environment.
