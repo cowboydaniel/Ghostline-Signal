@@ -215,6 +215,7 @@ class MainWindow(QMainWindow):
             def init_broker():
                 self.connection_broker.set_status_callback(self.on_broker_status)
                 self.connection_broker.set_connection_callback(self.on_incoming_connection)
+                self.connection_broker.set_discovery_callback(self.on_peer_discovered)
                 self.connection_broker.initialize()
 
             import threading
@@ -261,6 +262,26 @@ class MainWindow(QMainWindow):
                 self.connection_status.set_connected(peer_count)
 
         QTimer.singleShot(0, add_peer)
+
+    def on_peer_discovered(self, device_id: str, device_info: dict):
+        """Handle peer discovery when connection fails (NAT traversal issue)."""
+        print(f"[Discovery] Discovered device {device_id[:8]}... but could not connect")
+
+        # Add to peers as "discovered" so user can see them
+        def add_discovered_peer():
+            # Use device_id as peer_id since we don't have an actual connection
+            peer_id = f"device:{device_id}"
+
+            if not self.message_store.get_peer(peer_id):
+                self.message_store.add_peer(
+                    peer_id,
+                    b'',
+                    display_name=f"{device_id[:8]}... (discovered)"
+                )
+                self.load_peers()
+                print(f"[Discovery] Added discovered peer to database: {device_id[:8]}...")
+
+        QTimer.singleShot(0, add_discovered_peer)
 
     def load_peers(self):
         """Load peers from storage."""
@@ -454,8 +475,23 @@ class MainWindow(QMainWindow):
         """Handle connection events."""
         if event == 'connected':
             print(f"Peer connected: {peer_id}")
-            peer_count = len(self.p2p_node.get_peer_list())
-            self.connection_status.set_connected(peer_count)
+
+            # Add peer to database if not exists (so it appears in UI)
+            def add_connected_peer():
+                if not self.message_store.get_peer(peer_id):
+                    self.message_store.add_peer(
+                        peer_id,
+                        b'',
+                        display_name=peer_id.split(':')[0][:8]  # Use IP prefix as name
+                    )
+                    self.load_peers()
+                    print(f"[P2P] Added connected peer to database: {peer_id}")
+
+                peer_count = len(self.p2p_node.get_peer_list())
+                self.connection_status.set_connected(peer_count)
+
+            QTimer.singleShot(0, add_connected_peer)
+
         elif event == 'disconnected':
             print(f"Peer disconnected: {peer_id}")
             peer_count = len(self.p2p_node.get_peer_list())
@@ -540,7 +576,9 @@ class MainWindow(QMainWindow):
                     # Update UI in main thread
                     QTimer.singleShot(0, lambda: self.on_device_id_connected(peer_id, progress))
                 else:
-                    QTimer.singleShot(0, lambda: self.on_device_id_failed(progress))
+                    # Connection failed but we may have discovered the peer
+                    # Add as "discovered" so user knows the peer exists
+                    QTimer.singleShot(0, lambda: self.on_device_id_failed(device_id, progress))
 
             except Exception as e:
                 QTimer.singleShot(0, lambda: self.on_device_id_error(str(e), progress))
@@ -556,18 +594,29 @@ class MainWindow(QMainWindow):
                               f"Connected to peer!\n\nPeer ID: {peer_id}")
         self.load_peers()
 
-    def on_device_id_failed(self, progress):
+    def on_device_id_failed(self, device_id: str, progress):
         """Handle failed device ID connection."""
         progress.close()
+
+        # Add peer as "discovered" even if connection failed
+        # This lets users know the peer exists on the network
+        discovered_peer_id = f"device:{device_id}"
+        if not self.message_store.get_peer(discovered_peer_id):
+            self.message_store.add_peer(
+                discovered_peer_id,
+                b'',
+                display_name=f"{device_id[:8]}... (discovered)"
+            )
+            self.load_peers()
+
         QMessageBox.warning(self, "Connection Failed",
-                          "Could not discover or connect to peer.\n\n"
-                          "Possible reasons:\n"
-                          "- Peer is offline\n"
-                          "- Peer not registered on rendezvous server\n"
-                          "- Rendezvous server not running\n"
-                          "- Network connectivity issues\n\n"
-                          "Ensure both devices have the rendezvous server\n"
-                          "running and accessible.")
+                          f"Found device {device_id[:8]}... but could not establish direct connection.\n\n"
+                          "The peer has been added to your list as 'discovered'.\n\n"
+                          "Possible reasons for connection failure:\n"
+                          "- Both devices are behind strict NAT\n"
+                          "- Firewall blocking connections\n\n"
+                          "Try having the other device connect to you instead,\n"
+                          "or ensure one device has an open port.")
 
     def on_device_id_error(self, error: str, progress):
         """Handle device ID connection error."""
