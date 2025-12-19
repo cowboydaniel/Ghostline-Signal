@@ -237,6 +237,70 @@ class RendezvousClient:
             print(f"Lookup failed: {e}")
             return None
 
+    def send_connect_request(self, requester_id: str, target_id: str) -> Optional[Dict]:
+        """
+        Send a connection request to a target device.
+        Returns target's device info if successful.
+        """
+        try:
+            request = {
+                'action': 'connect_request',
+                'requester_id': requester_id,
+                'target_id': target_id,
+                'timestamp': time.time()
+            }
+
+            response = self._send_request(request)
+
+            if response and response.get('status') == 'ok':
+                return response.get('target_info')
+
+            return None
+
+        except Exception as e:
+            print(f"Connect request failed: {e}")
+            return None
+
+    def get_connect_requests(self, device_id: str) -> list:
+        """
+        Get pending connection requests for this device.
+        Returns list of requests with requester info.
+        """
+        try:
+            request = {
+                'action': 'get_connect_requests',
+                'device_id': device_id,
+                'timestamp': time.time()
+            }
+
+            response = self._send_request(request)
+
+            if response and response.get('status') == 'ok':
+                return response.get('requests', [])
+
+            return []
+
+        except Exception as e:
+            print(f"Get connect requests failed: {e}")
+            return []
+
+    def clear_connect_request(self, target_id: str, requester_id: str) -> bool:
+        """Clear a connection request after handling."""
+        try:
+            request = {
+                'action': 'clear_connect_request',
+                'target_id': target_id,
+                'requester_id': requester_id,
+                'timestamp': time.time()
+            }
+
+            response = self._send_request(request)
+            return response and response.get('status') == 'ok'
+
+        except Exception as e:
+            print(f"Clear connect request failed: {e}")
+            return False
+
     def unregister_device(self, device_id: str):
         """Unregister device from rendezvous server."""
         try:
