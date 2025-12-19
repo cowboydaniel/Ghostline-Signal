@@ -41,6 +41,11 @@ class DeviceRegistry:
         self.expiration_seconds = expiration_seconds
         self.lock = threading.Lock()
 
+        # Connection requests for coordinated NAT traversal
+        # Format: {target_device_id: [{requester_id, requester_info, timestamp}, ...]}
+        self.connect_requests: Dict[str, list] = {}
+        self.request_expiration = 30  # Connection requests expire after 30 seconds
+
         # Start cleanup thread
         self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self.cleanup_thread.start()
@@ -98,19 +103,104 @@ class DeviceRegistry:
                 1 for d in self.devices.values()
                 if (now - d['last_seen']) <= self.expiration_seconds
             )
+            pending_requests = sum(len(reqs) for reqs in self.connect_requests.values())
             return {
                 'total_registered': len(self.devices),
                 'active_devices': active_devices,
+                'pending_requests': pending_requests,
                 'expiration_seconds': self.expiration_seconds,
                 'uptime': int(now - getattr(self, 'start_time', now))
             }
 
+    def add_connect_request(self, requester_id: str, target_id: str) -> Optional[dict]:
+        """
+        Add a connection request from requester to target.
+        Returns the target's device info if found, None otherwise.
+        """
+        with self.lock:
+            # Check if target is registered
+            target_info = self.devices.get(target_id)
+            if not target_info:
+                return None
+
+            # Check if expired
+            if time.time() - target_info['last_seen'] > self.expiration_seconds:
+                return None
+
+            # Get requester info
+            requester_info = self.devices.get(requester_id)
+            if not requester_info:
+                return None
+
+            # Add request
+            if target_id not in self.connect_requests:
+                self.connect_requests[target_id] = []
+
+            # Remove any existing request from this requester
+            self.connect_requests[target_id] = [
+                r for r in self.connect_requests[target_id]
+                if r['requester_id'] != requester_id
+            ]
+
+            # Add new request
+            self.connect_requests[target_id].append({
+                'requester_id': requester_id,
+                'requester_info': {
+                    'device_id': requester_id,
+                    'public_addr': requester_info['public_addr'],
+                    'local_addr': requester_info['local_addr']
+                },
+                'timestamp': time.time()
+            })
+
+            return {
+                'device_id': target_id,
+                'public_addr': target_info['public_addr'],
+                'local_addr': target_info['local_addr']
+            }
+
+    def get_connect_requests(self, device_id: str) -> list:
+        """Get pending connection requests for a device."""
+        with self.lock:
+            now = time.time()
+            requests = self.connect_requests.get(device_id, [])
+
+            # Filter out expired requests
+            valid_requests = [
+                r for r in requests
+                if now - r['timestamp'] < self.request_expiration
+            ]
+
+            # Update stored requests
+            if valid_requests:
+                self.connect_requests[device_id] = valid_requests
+            elif device_id in self.connect_requests:
+                del self.connect_requests[device_id]
+
+            return valid_requests
+
+    def clear_connect_request(self, target_id: str, requester_id: str) -> bool:
+        """Clear a specific connection request."""
+        with self.lock:
+            if target_id in self.connect_requests:
+                original_len = len(self.connect_requests[target_id])
+                self.connect_requests[target_id] = [
+                    r for r in self.connect_requests[target_id]
+                    if r['requester_id'] != requester_id
+                ]
+                if not self.connect_requests[target_id]:
+                    del self.connect_requests[target_id]
+                return len(self.connect_requests.get(target_id, [])) < original_len
+            return False
+
     def _cleanup_loop(self):
-        """Periodically remove expired devices."""
+        """Periodically remove expired devices and connection requests."""
         while True:
             time.sleep(60)  # Check every minute
             with self.lock:
                 now = time.time()
+
+                # Clean up expired devices
                 expired = [
                     device_id for device_id, device in self.devices.items()
                     if (now - device['last_seen']) > self.expiration_seconds
@@ -120,6 +210,21 @@ class DeviceRegistry:
 
                 if expired:
                     print(f"[Cleanup] Removed {len(expired)} expired device(s)")
+
+                # Clean up expired connection requests
+                expired_requests = 0
+                for target_id in list(self.connect_requests.keys()):
+                    original_len = len(self.connect_requests[target_id])
+                    self.connect_requests[target_id] = [
+                        r for r in self.connect_requests[target_id]
+                        if now - r['timestamp'] < self.request_expiration
+                    ]
+                    expired_requests += original_len - len(self.connect_requests[target_id])
+                    if not self.connect_requests[target_id]:
+                        del self.connect_requests[target_id]
+
+                if expired_requests:
+                    print(f"[Cleanup] Removed {expired_requests} expired connection request(s)")
 
 
 class RendezvousHandler(BaseHTTPRequestHandler):
@@ -176,6 +281,12 @@ class RendezvousHandler(BaseHTTPRequestHandler):
             self._handle_heartbeat(request)
         elif action == 'unregister':
             self._handle_unregister(request)
+        elif action == 'connect_request':
+            self._handle_connect_request(request)
+        elif action == 'get_connect_requests':
+            self._handle_get_connect_requests(request)
+        elif action == 'clear_connect_request':
+            self._handle_clear_connect_request(request)
         else:
             self._send_response(400, {'error': 'Unknown action'})
 
@@ -255,6 +366,59 @@ class RendezvousHandler(BaseHTTPRequestHandler):
             self._send_response(200, {'status': 'ok'})
         else:
             self._send_response(404, {'error': 'Device not registered'})
+
+    def _handle_connect_request(self, request: dict):
+        """Handle connection request (for coordinated NAT traversal)."""
+        requester_id = request.get('requester_id')
+        target_id = request.get('target_id')
+
+        if not requester_id or not target_id:
+            self._send_response(400, {'error': 'Missing requester_id or target_id'})
+            return
+
+        target_info = self.registry.add_connect_request(requester_id, target_id)
+
+        if target_info:
+            print(f"[ConnectRequest] {requester_id[:8]}... -> {target_id[:8]}...")
+            self._send_response(200, {
+                'status': 'ok',
+                'target_info': target_info
+            })
+        else:
+            self._send_response(404, {
+                'status': 'not_found',
+                'error': 'Target device not found or requester not registered'
+            })
+
+    def _handle_get_connect_requests(self, request: dict):
+        """Handle getting pending connection requests."""
+        device_id = request.get('device_id')
+
+        if not device_id:
+            self._send_response(400, {'error': 'Missing device_id'})
+            return
+
+        requests = self.registry.get_connect_requests(device_id)
+
+        if requests:
+            print(f"[GetRequests] {device_id[:8]}... has {len(requests)} pending request(s)")
+
+        self._send_response(200, {
+            'status': 'ok',
+            'requests': requests
+        })
+
+    def _handle_clear_connect_request(self, request: dict):
+        """Handle clearing a connection request."""
+        target_id = request.get('target_id')
+        requester_id = request.get('requester_id')
+
+        if not target_id or not requester_id:
+            self._send_response(400, {'error': 'Missing target_id or requester_id'})
+            return
+
+        success = self.registry.clear_connect_request(target_id, requester_id)
+        self._send_response(200, {'status': 'ok', 'cleared': success})
 
     def _send_response(self, status_code: int, data: dict):
         """Send JSON response."""

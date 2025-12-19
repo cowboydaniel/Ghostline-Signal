@@ -4,6 +4,8 @@ Handles automatic peer discovery and NAT traversal using device IDs.
 """
 
 import socket
+import time
+import threading
 from typing import Optional, Callable, Dict
 from .nat_traversal import STUNClient, RendezvousClient, HolePuncher
 from .p2p import P2PNode
@@ -51,6 +53,12 @@ class ConnectionBroker:
             self.rendezvous = None
 
         self.status_callback: Optional[Callable] = None
+        self.connection_callback: Optional[Callable] = None
+
+        # Polling for incoming connection requests
+        self.running = False
+        self.poll_thread: Optional[threading.Thread] = None
+        self.poll_interval = 2  # Check every 2 seconds
 
     def initialize(self) -> bool:
         """
@@ -91,10 +99,58 @@ class ConnectionBroker:
 
             if success:
                 self._notify_status("Registered with rendezvous server")
+                # Start polling for incoming connection requests
+                self._start_request_polling()
             else:
-                self._notify_status("Rendezvous server not available (manual connection only)")
+                self._notify_status("Rendezvous server not available")
 
         return True
+
+    def _start_request_polling(self):
+        """Start polling for incoming connection requests."""
+        if self.poll_thread and self.poll_thread.is_alive():
+            return
+
+        self.running = True
+
+        def poll_loop():
+            while self.running:
+                try:
+                    self._check_incoming_requests()
+                except Exception as e:
+                    print(f"[ConnectionBroker] Poll error: {e}")
+                time.sleep(self.poll_interval)
+
+        self.poll_thread = threading.Thread(target=poll_loop, daemon=True)
+        self.poll_thread.start()
+        self._notify_status("Listening for incoming connection requests")
+
+    def _check_incoming_requests(self):
+        """Check for and handle incoming connection requests."""
+        if not self.rendezvous:
+            return
+
+        requests = self.rendezvous.get_connect_requests(self.device_id)
+
+        for req in requests:
+            requester_id = req.get('requester_id')
+            requester_info = req.get('requester_info', {})
+
+            if not requester_id:
+                continue
+
+            self._notify_status(f"Incoming connection request from {requester_id[:8]}...")
+
+            # Try to connect back to the requester
+            peer_id = self._connect_to_device_info(requester_info)
+
+            if peer_id:
+                self._notify_status(f"Connected to {requester_id[:8]}...")
+                # Clear the request
+                self.rendezvous.clear_connect_request(self.device_id, requester_id)
+                # Notify callback if set
+                if self.connection_callback:
+                    self.connection_callback(peer_id, requester_id)
 
     def connect_by_device_id(self, peer_device_id: str) -> Optional[str]:
         """
@@ -103,16 +159,52 @@ class ConnectionBroker:
 
         Returns peer_id (host:port) if successful, None otherwise.
         """
-        self._notify_status(f"Looking up device: {peer_device_id}")
+        self._notify_status(f"Looking up device: {peer_device_id[:8]}...")
 
-        # Try rendezvous server first
-        if self.use_rendezvous and self.rendezvous:
-            device_info = self.rendezvous.lookup_device(peer_device_id)
+        if not self.use_rendezvous or not self.rendezvous:
+            self._notify_status("Rendezvous server not configured")
+            return None
 
-            if device_info:
-                return self._connect_to_device_info(device_info)
+        # Step 1: Send a connection request so the peer knows we want to connect
+        # This enables the peer to also try connecting to us (for NAT traversal)
+        self._notify_status("Sending connection request...")
+        target_info = self.rendezvous.send_connect_request(self.device_id, peer_device_id)
 
-        self._notify_status("Peer not found on rendezvous server")
+        if not target_info:
+            self._notify_status("Peer not found on rendezvous server")
+            return None
+
+        # Step 2: Try to connect to the peer
+        # While we're doing this, the peer may also be trying to connect to us
+        self._notify_status("Attempting connection...")
+        peer_id = self._connect_to_device_info(target_info)
+
+        if peer_id:
+            # Clear our request since we connected
+            self.rendezvous.clear_connect_request(peer_device_id, self.device_id)
+            return peer_id
+
+        # Step 3: If direct connection failed, wait briefly for peer to connect to us
+        # The peer should have seen our request and may be connecting back
+        self._notify_status("Waiting for peer to establish connection...")
+        initial_peers = set(self.p2p_node.get_peer_list())
+
+        for i in range(10):  # Wait up to 10 seconds
+            time.sleep(1)
+            # Check if a new peer connected to us
+            current_peers = set(self.p2p_node.get_peer_list())
+            new_peers = current_peers - initial_peers
+
+            if new_peers:
+                # A new peer appeared - it might be our target
+                new_peer_id = next(iter(new_peers))
+                self._notify_status(f"Peer connected: {new_peer_id}")
+                return new_peer_id
+
+            if i == 4:
+                self._notify_status("Still waiting for peer...")
+
+        self._notify_status("Connection failed - peer may be behind strict NAT")
         return None
 
     def _connect_to_device_info(self, device_info: Dict) -> Optional[str]:
@@ -159,11 +251,12 @@ class ConnectionBroker:
             sock = HolePuncher.punch_hole_tcp(self.local_port, remote_ip, remote_port)
             if sock:
                 # Connection established via hole punching
-                # Would need to integrate with P2PNode
-                sock.close()
-                return f"{remote_ip}:{remote_port}"
-        except:
-            pass
+                # Integrate the socket with P2PNode
+                peer_id = f"{remote_ip}:{remote_port}"
+                self.p2p_node.add_connected_socket(sock, peer_id)
+                return peer_id
+        except Exception as e:
+            self._notify_status(f"Hole punching failed: {e}")
 
         return None
 
@@ -191,8 +284,15 @@ class ConnectionBroker:
 
     def shutdown(self):
         """Shutdown connection broker."""
+        self.running = False
+        if self.poll_thread and self.poll_thread.is_alive():
+            self.poll_thread.join(timeout=3)
         if self.rendezvous:
             self.rendezvous.unregister_device(self.device_id)
+
+    def set_connection_callback(self, callback: Callable):
+        """Set callback for new incoming connections."""
+        self.connection_callback = callback
 
     def get_connection_info(self) -> Dict:
         """Get connection information for sharing."""

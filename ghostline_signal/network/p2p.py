@@ -92,10 +92,11 @@ class P2PNode:
                 if self.running:
                     print(f"Error accepting connection: {e}")
 
-    def connect_to_peer(self, host: str, port: int) -> str:
+    def connect_to_peer(self, host: str, port: int, timeout: int = 5) -> str:
         """Connect to a remote peer."""
         try:
             peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer_socket.settimeout(timeout)
             peer_socket.connect((host, port))
 
             peer_id = f"{host}:{port}"
@@ -117,6 +118,24 @@ class P2PNode:
 
         except Exception as e:
             raise ConnectionError(f"Failed to connect to {host}:{port}: {e}")
+
+    def add_connected_socket(self, sock: socket.socket, peer_id: str) -> str:
+        """Add an already-connected socket as a peer (e.g., from hole punching)."""
+        with self._lock:
+            self.peers[peer_id] = sock
+
+        # Start handling this peer
+        thread = threading.Thread(
+            target=self._handle_peer,
+            args=(peer_id, sock),
+            daemon=True
+        )
+        thread.start()
+
+        if self.connection_callback:
+            self.connection_callback(peer_id, 'connected')
+
+        return peer_id
 
     def _handle_peer(self, peer_id: str, sock: socket.socket):
         """Handle communication with a peer."""
