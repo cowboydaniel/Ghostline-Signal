@@ -54,6 +54,7 @@ class ConnectionBroker:
 
         self.status_callback: Optional[Callable] = None
         self.connection_callback: Optional[Callable] = None
+        self.discovery_callback: Optional[Callable] = None  # Called when peer discovered
 
         # Polling for incoming connection requests
         self.running = False
@@ -144,13 +145,19 @@ class ConnectionBroker:
             # Try to connect back to the requester
             peer_id = self._connect_to_device_info(requester_info)
 
+            # Clear the request regardless of connection success
+            self.rendezvous.clear_connect_request(self.device_id, requester_id)
+
             if peer_id:
                 self._notify_status(f"Connected to {requester_id[:8]}...")
-                # Clear the request
-                self.rendezvous.clear_connect_request(self.device_id, requester_id)
                 # Notify callback if set
                 if self.connection_callback:
                     self.connection_callback(peer_id, requester_id)
+            else:
+                # Connection failed but we discovered the peer - notify discovery callback
+                self._notify_status(f"Discovered {requester_id[:8]}... but could not connect (NAT)")
+                if self.discovery_callback:
+                    self.discovery_callback(requester_id, requester_info)
 
     def connect_by_device_id(self, peer_device_id: str) -> Optional[str]:
         """
@@ -293,6 +300,10 @@ class ConnectionBroker:
     def set_connection_callback(self, callback: Callable):
         """Set callback for new incoming connections."""
         self.connection_callback = callback
+
+    def set_discovery_callback(self, callback: Callable):
+        """Set callback for peer discovery (even when connection fails)."""
+        self.discovery_callback = callback
 
     def get_connection_info(self) -> Dict:
         """Get connection information for sharing."""
